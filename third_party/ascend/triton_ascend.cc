@@ -20,7 +20,10 @@
 #include "ascend/include/TritonToHIVM/Passes.h"
 #include "ascend/include/TritonToHFusion/Passes.h"
 #include "ascend/include/TritonToLLVM/Passes.h"
- #include "ascend/include/TritonAffinityOpt/Passes.h"
+
+#include "ascend/include/DynamicCVPipeline/Passes.h"
+// todo: this code will be removed in version 530.
+#include "ascend/include/TritonAffinityOpt/Passes.h"
 
 #include "triton/Dialect/Triton/IR/Dialect.h"
 #include "ir.h" // TritonOpBuilder
@@ -349,6 +352,14 @@ void init_triton_ascend_passes_ttir(py::module &&m) {
   m.def("add_bubble_up_operation", [](mlir::PassManager &pm) {
     pm.addPass(mlir::triton::createBubbleUpOperationPass());});
 
+  m.def("add_dynamic_cv_pipeline", [](mlir::PassManager &pm,
+    bool compileOn91095) {
+      AddDynamicCVPipelineOptions opts;
+      opts.compileOn91095 = compileOn91095;
+      pm.addPass(mlir::triton::createAddDynamicCVPipelinePass(opts));
+    });
+
+  // todo: this code will be removed in version 530.
   m.def("add_dag_sync", [](mlir::PassManager &pm) {
     pm.addPass(mlir::triton::createDAGSyncPass());});
  	   
