@@ -24,10 +24,12 @@
 #define TRITON_ADAPTER_OP_CLASSIFIER_H
 
 #include "bishengir/Dialect/HIVM/IR/HIVM.h"
+#include "ascend/include/DynamicCVPipeline/Common/MemoryEffectsTracker.h"
 #include "mlir/Dialect/Bufferization/IR/Bufferization.h"
 #include "mlir/Dialect/Linalg/IR/Linalg.h"
 #include "mlir/Dialect/MemRef/IR/MemRef.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
+#include "mlir/Analysis/AliasAnalysis.h"
 #include "mlir/IR/BuiltinOps.h"
 #include "mlir/Pass/Pass.h"
 #include "mlir/Pass/PassManager.h"
@@ -60,6 +62,9 @@ private:
     // Seed operations for CUBE upstream propagation
     llvm::SmallVector<Operation *> cubeSeeds;
 
+    std::shared_ptr<AliasAnalysis> aliasAnalysis;
+    std::shared_ptr<MemoryDependenceGraph> memDepGraph;
+
     // Mark an operation as CUBE
     void markCube(Operation *op);
 
@@ -78,6 +83,9 @@ private:
 
     // Propagate CUBE core type upstream
     int propagateCubeUpstream();
+
+    // Get upstream operations based on both SSA and memory dependencies
+    void getUpstreamOpsWithMemoryDeps(Operation *cur, llvm::SmallVectorImpl<Operation *> &upstreamOps);
 };
 
 // Create the pass

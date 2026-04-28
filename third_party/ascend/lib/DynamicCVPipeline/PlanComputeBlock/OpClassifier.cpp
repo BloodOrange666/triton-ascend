@@ -21,6 +21,8 @@
  */
 
 #include "ascend/include/DynamicCVPipeline/PlanComputeBlock/OpClassifier.h"
+#include <queue>
+#include "llvm/ADT/DenseSet.h"
 #include "llvm/Support/Debug.h"
 
 using namespace mlir;
@@ -286,10 +288,56 @@ int OpClassifierPass::patternMatchCUBE()
     return 0;
 }
 
+// Helper function to get upstream operations based on both SSA and memory dependencies
+void OpClassifierPass::getUpstreamOpsWithMemoryDeps(Operation *cur, llvm::SmallVectorImpl<Operation *> &upstreamOps)
+{
+    // Collect SSA dependencies (direct operands)
+    for (Value operand : cur->getOperands()) {
+        Operation *def = operand.getDefiningOp();
+        if (def && def != cur) {
+            upstreamOps.push_back(def);
+        }
+    }
+    if (!isa<bufferization::ToTensorOp>(cur)) {
+        // Only consider memory dependencies for non-to_tensor ops,
+        // as to_tensor already has SSA deps to its memref source
+        return;
+    }
+    // Collect memory dependencies
+    if (memDepGraph) {
+        // Get operations that define memory used by current op
+        for (Operation *memDef : memDepGraph->getMemDefs(cur)) {
+            LLVM_DEBUG(DBGS() << "memDef: cur " << *cur << " -> memDef " << *memDef << "\n");
+            if (isa<memref::CopyOp>(memDef)) {
+                upstreamOps.push_back(memDef);
+            }
+        }
+    }
+}
+
 // Propagate CUBE core type upstream
 int OpClassifierPass::propagateCubeUpstream()
 {
-    LDBG("--- Step 2: CUBE upstream BFS --->\n");
+    LDBG("--- Step 2: CUBE upstream BFS --->");
+    llvm::DenseSet<Operation *> cubeVisited;
+    std::queue<Operation *> cubeQueue;
+
+    for (Operation *seed : cubeSeeds) {
+        cubeVisited.insert(seed);
+        cubeQueue.push(seed);
+    }
+
+    while (!cubeQueue.empty()) {
+        Operation *cur = cubeQueue.front();
+        cubeQueue.pop();
+
+        // Get upstream operations considering both SSA and memory dependencies
+        llvm::SmallVector<Operation *> upstreamOps;
+        getUpstreamOpsWithMemoryDeps(cur, upstreamOps);
+
+        // Next step: Reverse-propagate CUBE-only marking to upstream ops,
+        // but stop at visited/matmul ops and skip values defined inside nested linalg regions.
+    }
 
     return 0;
 }
@@ -300,6 +348,9 @@ void OpClassifierPass::runOnOperation()
     LDBG("\n--- Step 1: Running OpClassifierPass --->\n");
 
     ModuleOp module = getOperation();
+
+    aliasAnalysis = std::make_shared<AliasAnalysis>(module);
+    memDepGraph = std::make_shared<MemoryDependenceGraph>(module, *aliasAnalysis);
 
     // Initialize the pass
     // Collect all operations
