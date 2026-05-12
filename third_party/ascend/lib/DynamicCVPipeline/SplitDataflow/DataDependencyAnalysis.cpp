@@ -45,9 +45,14 @@ static constexpr const char *DEBUG_TYPE = "data-dependency-analysis";
 
 using namespace mlir::triton;
 
+// Attribute name constants
+static constexpr const char *kBlockIdAttr = "ssbuffer.block_id";
+static constexpr const char *kCoreTypeAttr = "ssbuffer.core_type";
+static constexpr const char *kTransferIdAttr = "ssbuffer.transfer_id";
+
 // Helper: ssbuffer.core_type
 llvm::StringRef getSsbufferCoreType(Operation* op) {
-  if (auto attr = op->getAttrOfType<mlir::StringAttr>("ssbuffer.core_type")) {
+  if (auto attr = op->getAttrOfType<mlir::StringAttr>(kCoreTypeAttr)) {
     return attr.getValue();
   }
   return "";

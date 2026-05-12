@@ -54,6 +54,11 @@ static constexpr const char *DEBUG_TYPE = "inter-core-transfer-and-sync";
 using namespace mlir::triton;
 using namespace hivm;
 
+// Attribute name constants
+static constexpr const char *kBlockIdAttr = "ssbuffer.block_id";
+static constexpr const char *kCoreTypeAttr = "ssbuffer.core_type";
+static constexpr const char *kTransferIdAttr = "ssbuffer.transfer_id";
+
 static uint64_t getElemBytesForAlign(Type t) {
   if (auto ft = dyn_cast<FloatType>(t))
     return (uint64_t)((ft.getWidth() + 7) / 8);
@@ -80,15 +85,15 @@ static uint64_t getBlockElemsFor32BAlign(Type elemType) {
 
 static void attachCommonTags(Operation *op, int blockId, StringRef coreType) {
   MLIRContext* ctx = op->getContext();
-  op->setAttr("ssbuffer.block_id", IntegerAttr::get(IntegerType::get(ctx, 32), blockId));
-  op->setAttr("ssbuffer.core_type", StringAttr::get(ctx, coreType));
+  op->setAttr(kBlockIdAttr, IntegerAttr::get(IntegerType::get(ctx, 32), blockId));
+  op->setAttr(kCoreTypeAttr, StringAttr::get(ctx, coreType));
 }
 
 static void attachTransferTags(Operation *op, int blockId, StringRef coreType, int transferId) {
   MLIRContext* ctx = op->getContext();
-  op->setAttr("ssbuffer.block_id", IntegerAttr::get(IntegerType::get(ctx, 32), blockId));
-  op->setAttr("ssbuffer.core_type", StringAttr::get(ctx, coreType));
-  op->setAttr("ssbuffer.transfer_id", IntegerAttr::get(IntegerType::get(ctx, 32), transferId));
+  op->setAttr(kBlockIdAttr, IntegerAttr::get(IntegerType::get(ctx, 32), blockId));
+  op->setAttr(kCoreTypeAttr, StringAttr::get(ctx, coreType));
+  op->setAttr(kTransferIdAttr, IntegerAttr::get(IntegerType::get(ctx, 32), transferId));
 }
 
 // Block Start/End Operation Retrieval
