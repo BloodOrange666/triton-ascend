@@ -55,5 +55,12 @@ std::unique_ptr<OperationPass<ModuleOp>> createComputeBlockOptPass()
     return std::make_unique<ComputeBlockOptPass>();
 }
 
+void registerComputeBlockOptPasses()
+{
+    registerPass([]() -> std::unique_ptr<mlir::Pass> { return createComputeBlockOptPass(); });
+    registerPass(createUBUsageOptPass);
+    registerPass(createFuseAdotBaddCPass);
+}
+
 } // namespace triton
 } // namespace mlir

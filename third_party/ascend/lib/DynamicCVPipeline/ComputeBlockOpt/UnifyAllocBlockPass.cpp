@@ -532,5 +532,9 @@ std::unique_ptr<OperationPass<ModuleOp>> createUnifyAllocBlockPass() {
   return std::make_unique<UnifyAllocBlockPass>();
 }
 
+void registerUnifyAllocBlockPass() {
+  PassRegistration<UnifyAllocBlockPass> reg;
+}
+
 } // namespace triton
 } // namespace mlir
