@@ -448,3 +448,5 @@ def test_exceed_threads(device):
     warp_size = triton.runtime.driver.active.get_current_target().warp_size
     assert exception_out_of_resource is not None and f"out of resource: threads, Required: {128 * warp_size}" in str(
         exception_out_of_resource)
+
+

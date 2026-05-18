@@ -74,10 +74,25 @@ def min_dot_size(target: GPUTarget):
     return lambda lhsType, rhsType: (1, 1, 1)
 
 
-def make_ttir(mod, metadata, opt):
-    if "hash" not in metadata:
-        metadata["hash"] = hashlib.sha256(f"{mod}-{metadata}".encode()).hexdigest()
-    # the same optimize pass for triton-ir as all other backends
+# Side channel for costmodel: stores the TTIR string of the last compile-only
+# invocation so Autotuner._costmodel_bench() can read it without disk I/O.
+_costmodel_ttir: Optional[str] = None
+
+
+
+def _strip_incompat_mlir_syntax(mlir_text: str) -> str:
+    """Remove MLIR syntax not supported by older CANN bishengir-compile."""
+    lines = mlir_text.split('\n')
+    result = []
+    for line in lines:
+        if 'bufferization.to_tensor' in line:
+            line = re.sub(r'\s+to\s+tensor<[^>]+>', '', line)
+        result.append(line)
+    return '\n'.join(result)
+
+
+def _run_ttir_pass_pipeline(mod):
+    """Run the common TTIR optimization pipeline shared by all modes."""
     pm = ir.pass_manager(mod.context)
     pm.enable_debug()
     passes.common.add_inliner(pm)
@@ -89,7 +104,19 @@ def make_ttir(mod, metadata, opt):
     passes.common.add_symbol_dce(pm)
     passes.ttir.add_loop_unroll(pm)
     pm.run(mod)
-    if opt.debug:
+
+
+def make_ttir(mod, metadata, opt):
+    if "hash" not in metadata:
+        metadata["hash"] = hashlib.sha256(f"{mod}-{metadata}".encode()).hexdigest()
+
+    # The same optimize pass for triton-ir as all other backends.
+    _run_ttir_pass_pipeline(mod)
+
+    if getattr(opt, "enable_costmodel_backend", False):
+        global _costmodel_ttir
+        _costmodel_ttir = str(mod)
+    elif opt.debug:
         dump_manager = get_dump_manager(metadata["hash"])
         print(f"Dumping intermediate results to {dump_manager.cache_dir}")
         dump_manager.put(str(mod), "kernel.ttir.mlir", binary=False)
@@ -411,6 +438,8 @@ def linalg_to_bin_enable_npu_compile_910_95(linalg: str, metadata, opt):
     with tempfile.TemporaryDirectory() as tmpdir:
         tmp_file_name = "kernel.mlir" if opt.use_bytecode else "kernel.ttadapter.mlir"
         ttadapter_path = os.path.join(tmpdir, tmp_file_name)
+        if not opt.use_bytecode:
+            linalg = _strip_incompat_mlir_syntax(linalg)
         Path(ttadapter_path).write_text(linalg)
         bin_file = os.path.join(tmpdir, "kernel")
         if _check_bishengir_api_change():
@@ -635,6 +664,8 @@ def linalg_to_bin_enable_npu_compile_A2_A3(linalg: str, metadata, opt):
     with tempfile.TemporaryDirectory() as tmpdir:
         tmp_file_name = "kernel.mlir" if opt.use_bytecode else "kernel.ttadapter.mlir"
         ttadapter_path = os.path.join(tmpdir, tmp_file_name)
+        if not opt.use_bytecode:
+            linalg = _strip_incompat_mlir_syntax(linalg)
         Path(ttadapter_path).write_text(linalg)
         bin_file = os.path.join(tmpdir, "kernel")
         if _check_bishengir_api_change():
@@ -940,6 +971,7 @@ class NPUOptions:
     use_bytecode: bool = True
     # take effect on the reorder instruction pattern for SIMT. The pattern is disabled by default.
     enable_simt_reorder_instruction: bool = False
+    enable_costmodel_backend: bool = False
     # disable simt fma optimization to get high precision
     disable_fma: bool = False
 
@@ -964,8 +996,6 @@ class NPUOptions:
         key = "_".join([f"{name}-{val}" for name, val in self.__dict__.items()])
         key = "_".join([key, get_cann_version_file_hash()])
         return hashlib.sha256(key.encode("utf-8")).hexdigest()
-
-
 
 
 def ttir_to_npubin(mod, metadata, opt):
@@ -1054,6 +1084,10 @@ class AscendBackend(BaseBackend):
             }
             args.setdefault("arch", self.target.arch)
             options = NPUOptions(**args)
+            # Costmodel path should avoid extra BC<->MLIR conversion stages
+            # to keep compile-only autotune routing lightweight and stable.
+            if getattr(options, "enable_costmodel_backend", False):
+                object.__setattr__(options, "use_bytecode", False)
         else:
             raise NotImplementedError(
                 f"Backend '{self.target.backend}' is not supported. "

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import builtins
+import os
 import time
 import inspect
 import hashlib
@@ -8,7 +9,7 @@ import json
 from functools import cached_property
 import itertools
 
-from typing import Any, Dict, Tuple, List, Optional, List
+from typing import Any, Dict, Tuple, List, Optional
 
 from .. import knobs
 from .jit import KernelInterface, JITFunction
@@ -16,6 +17,57 @@ from .errors import OutOfResources, PTXASError
 from .driver import driver
 from .cache import get_cache_manager, triton_key
 from triton._C.libtriton import get_cache_invalidating_env_vars
+from triton.backends.ascend.runtime.costmodel_runtime import (
+    candidate_tritonsim_opts as _tp_candidate_tritonsim_opts,
+    resolve_tritonsim_opt as _tp_resolve_tritonsim_opt,
+    capture_ttir as _tp_capture_ttir,
+    run_costmodel as _tp_run_costmodel,
+    get_costmodel_jobs as _tp_get_costmodel_jobs,
+    make_costmodel_cache_key as _tp_make_costmodel_cache_key,
+    load_costmodel_latency as _tp_load_costmodel_latency,
+    store_costmodel_latency as _tp_store_costmodel_latency,
+    parse_latency as _tp_parse_latency,
+    costmodel_bench as _tp_costmodel_bench,
+)
+
+
+def _candidate_tritonsim_opts():
+    # Delegated implementation lives under third_party.
+    yield from _tp_candidate_tritonsim_opts()
+
+
+def _resolve_tritonsim_opt():
+    """Find the tritonsim-opt binary for Ascend costmodel evaluation."""
+    return _tp_resolve_tritonsim_opt()
+
+
+def capture_ttir(launch):
+    """Capture TTIR via compiler side-channel without disk I/O."""
+    return _tp_capture_ttir(launch)
+
+
+def run_costmodel(ttir_or_path, extra_args=None, dump_ir_on_error=False):
+    """Run tritonsim-opt on TTIR text (stdin) or a file path."""
+    return _tp_run_costmodel(ttir_or_path, extra_args=extra_args, dump_ir_on_error=dump_ir_on_error)
+
+
+_COSTMODEL_MEM_CACHE: Dict[str, float] = {}
+
+
+def _get_costmodel_jobs(num_tasks: int) -> int:
+    return _tp_get_costmodel_jobs(num_tasks)
+
+
+def _make_costmodel_cache_key(ttir: str, extra_args: Optional[List[str]]) -> str:
+    return _tp_make_costmodel_cache_key(ttir, extra_args)
+
+
+def _load_costmodel_latency(cache_key: str) -> Optional[float]:
+    return _tp_load_costmodel_latency(cache_key)
+
+
+def _store_costmodel_latency(cache_key: str, latency: float) -> None:
+    _tp_store_costmodel_latency(cache_key, latency)
 
 
 class Autotuner(KernelInterface):
@@ -223,20 +275,31 @@ class Autotuner(KernelInterface):
                 used_cached_result = False
                 pruned_configs = self.prune_configs(kwargs)
 
-                def benchmark():
-                    bench_start = time.time()
-                    timings = {config: self._bench(*args, config=config, **kwargs) for config in pruned_configs}
-                    bench_end = time.time()
-                    self.bench_time = bench_end - bench_start
-                    self.cache[key] = builtins.min(timings, key=timings.get)
-                    full_nargs = {**self.nargs, **kwargs, **self.cache[key].all_kwargs()}
-                    self.pre_hook(full_nargs, reset_only=True)
-                    self.configs_timings = timings
+                enable_costmodel_backend = bool(kwargs.get("enable_costmodel_backend", False))
+                if not enable_costmodel_backend:
+                    enable_costmodel_backend = any(
+                        bool(cfg.kwargs.get("enable_costmodel_backend", False))
+                        for cfg in pruned_configs
+                    )
 
-                if self.cache_results:
-                    used_cached_result = self.check_disk_cache(key, pruned_configs, benchmark)
+                if enable_costmodel_backend:
+                    self._costmodel_bench(*args, pruned_configs=pruned_configs, key=key, **kwargs)
                 else:
-                    benchmark()
+
+                    def benchmark():
+                        bench_start = time.time()
+                        timings = {config: self._bench(*args, config=config, **kwargs) for config in pruned_configs}
+                        bench_end = time.time()
+                        self.bench_time = bench_end - bench_start
+                        self.cache[key] = builtins.min(timings, key=timings.get)
+                        full_nargs = {**self.nargs, **kwargs, **self.cache[key].all_kwargs()}
+                        self.pre_hook(full_nargs, reset_only=True)
+                        self.configs_timings = timings
+
+                    if self.cache_results:
+                        used_cached_result = self.check_disk_cache(key, pruned_configs, benchmark)
+                    else:
+                        benchmark()
 
             config = self.cache[key]
         else:
@@ -279,6 +342,17 @@ class Autotuner(KernelInterface):
                 }
                 pruned_configs = sorted(est_timing.keys(), key=lambda x: est_timing[x])[:top_k]
         return pruned_configs
+
+    def _costmodel_bench(self, *args, pruned_configs, key, **kwargs):
+        """Evaluate all candidate configs via costmodel and expose a config->time map."""
+        costmodel_latencies = _tp_costmodel_bench(self, *args, pruned_configs=pruned_configs, key=key, **kwargs)
+        self.configs_timings = costmodel_latencies
+        return costmodel_latencies
+
+    @staticmethod
+    def _parse_latency(stdout: str) -> float:
+        """Parse estimated latency (in us) from tritonsim-opt output."""
+        return _tp_parse_latency(stdout)
 
     def warmup(self, *args, **kwargs):
         self.nargs = dict(zip(self.arg_names, args))

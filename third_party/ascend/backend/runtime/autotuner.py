@@ -414,14 +414,24 @@ class AutoTilingTuner(Autotuner):
             pruned_configs = self.prune_configs(kwargs)
             if len(pruned_configs) > 1:
                 used_cached_result = False
-                bench_start = time.time()
-                timings = self._batch_bench(*args, configs=pruned_configs, **kwargs)
-                bench_end = time.time()
-                self.bench_time = bench_end - bench_start
-                self.cache[key] = builtins.min(timings, key=timings.get)
-                full_nargs = {**self.nargs, **kwargs, **self.cache[key].all_kwargs()}
-                self.pre_hook(full_nargs, reset_only=True)
-                self.configs_timings = timings
+                enable_costmodel_backend = bool(kwargs.get("enable_costmodel_backend", False))
+                if not enable_costmodel_backend:
+                    enable_costmodel_backend = any(
+                        bool(cfg.kwargs.get("enable_costmodel_backend", False))
+                        for cfg in pruned_configs
+                    )
+
+                if enable_costmodel_backend:
+                    self._costmodel_bench(*args, pruned_configs=pruned_configs, key=key, **kwargs)
+                else:
+                    bench_start = time.time()
+                    timings = self._batch_bench(*args, configs=pruned_configs, **kwargs)
+                    bench_end = time.time()
+                    self.bench_time = bench_end - bench_start
+                    self.cache[key] = builtins.min(timings, key=timings.get)
+                    full_nargs = {**self.nargs, **kwargs, **self.cache[key].all_kwargs()}
+                    self.pre_hook(full_nargs, reset_only=True)
+                    self.configs_timings = timings
                 config = self.cache[key]
             else:
                 config = pruned_configs[0]

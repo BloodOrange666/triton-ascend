@@ -104,3 +104,7 @@ build/
 dist/
 *.egg-info/
 .eggs/
+
+third_party/vTriton/build_*/
+third_party/vTriton/build*/
+python/triton/_C/*

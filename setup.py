@@ -396,6 +396,74 @@ def download_and_copy(name, src_func, dst_path, variable, version, url_func):
 
 # ---- cmake extension ----
 
+def _ensure_llvm_syspath_for_vtriton():
+    """Resolve LLVM_SYSPATH consistently with triton-ascend core build.
+
+    Preference order:
+    1) explicit env (LLVM_SYSPATH / LLVM_INSTALL_PREFIX)
+    2) resolve via get_thirdparty_packages(get_llvm_package_info()), which is
+       exactly the same source used by triton-ascend CMake configure.
+    """
+    llvm_syspath = os.environ.get("LLVM_SYSPATH") or os.environ.get("LLVM_INSTALL_PREFIX")
+    if llvm_syspath:
+        return llvm_syspath
+
+    for arg in get_thirdparty_packages([get_llvm_package_info()]):
+        if arg.startswith("-DLLVM_SYSPATH="):
+            llvm_syspath = arg.split("=", 1)[1]
+            if llvm_syspath:
+                os.environ.setdefault("LLVM_SYSPATH", llvm_syspath)
+                return llvm_syspath
+    return None
+
+
+def maybe_build_vtriton_dependency():
+    """Build third_party/vTriton (tritonsim-opt) as an internal dependency."""
+    if not check_env_flag("TRITON_ASCEND_BUILD_VTRITON", "ON"):
+        print("Skipping vTriton build (TRITON_ASCEND_BUILD_VTRITON=OFF)")
+        return
+
+    base = Path(get_base_dir())
+    vtriton_root = base / "third_party" / "vTriton"
+    if not vtriton_root.exists():
+        print(f"vTriton submodule not found at {vtriton_root}, skip auto-build")
+        return
+
+    build_dir = Path(os.environ.get("TRITON_ASCEND_VTRITON_BUILD_DIR", str(vtriton_root / "build")))
+    build_type = os.environ.get("TRITON_ASCEND_VTRITON_BUILD_TYPE", "Release")
+    tritonsim_opt = build_dir / "bin" / "tritonsim-opt"
+
+    if tritonsim_opt.is_file() and not check_env_flag("TRITON_ASCEND_FORCE_REBUILD_VTRITON", "OFF"):
+        print(f"Reusing existing vTriton binary: {tritonsim_opt}")
+        return
+
+    build_dir.mkdir(parents=True, exist_ok=True)
+
+    llvm_syspath = _ensure_llvm_syspath_for_vtriton()
+    enable_triton = os.environ.get("TRITON_ASCEND_VTRITON_ENABLE_TRITON", "OFF")
+    cmake_cfg = ["cmake", "-G", "Ninja", "-S", str(vtriton_root), "-B", str(build_dir),
+                 f"-DCMAKE_BUILD_TYPE={build_type}",
+                 f"-DTRITONSIM_ENABLE_TRITON={enable_triton}"]
+    if llvm_syspath:
+        cmake_cfg += [
+            f"-DMLIR_DIR={llvm_syspath}/lib/cmake/mlir",
+            f"-DLLVM_DIR={llvm_syspath}/lib/cmake/llvm",
+        ]
+
+    print("Configuring vTriton:", " ".join(cmake_cfg))
+    subprocess.check_call(cmake_cfg)
+
+    jobs = os.environ.get("MAX_JOBS", str(os.cpu_count() or 8))
+    cmake_build = ["cmake", "--build", str(build_dir), "-j", jobs]
+    print("Building vTriton:", " ".join(cmake_build))
+    subprocess.check_call(cmake_build)
+
+    if not tritonsim_opt.is_file():
+        raise RuntimeError(f"vTriton build finished but tritonsim-opt not found: {tritonsim_opt}")
+
+    os.environ.setdefault("TRITONSIM_OPT", str(tritonsim_opt))
+    print(f"vTriton ready: {tritonsim_opt}")
+
 
 class CMakeClean(clean):
 
@@ -489,6 +557,7 @@ class CMakeBuild(build_ext):
 
     def run(self):
         download_and_copy_dependencies()
+        maybe_build_vtriton_dependency()
 
         try:
             out = subprocess.check_output(["cmake", "--version"])
