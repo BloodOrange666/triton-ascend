@@ -98,6 +98,7 @@ def _adjust_metadata_by_module_result(mod, metadata, opt, **kwargs):
         metadata["enable_dynamic_cv_pipeline"] = False
         metadata["enable_mixed_cv"] = kwargs["enable_mixed_cv"]
         metadata["disable_auto_inject_block_sync"] = kwargs["disable_auto_inject_block_sync"]
+        metadata["set_workspace_multibuffer"] = kwargs["set_workspace_multibuffer"]
         if opt.debug:
             print(f"SSBUFFER return code={rc}, will fallback to enable_dynamic_cv_pipeline=False")
 
@@ -157,6 +158,7 @@ def ttir_to_linalg(mod, metadata, opt, *, named_ops=False):
         auto_blockify_size = metadata["auto_blockify_size"]
         enable_mixed_cv = metadata["enable_mixed_cv"]
         disable_auto_inject_block_sync = metadata["disable_auto_inject_block_sync"]
+        set_workspace_multibuffer = metadata["set_workspace_multibuffer"]
         if has_auto_blockify_blacklist_op or not auto_map_parallel_blocks_enabled:
             auto_blockify_size = 1
         pm = ir.pass_manager(mod.context)
@@ -210,10 +212,7 @@ def ttir_to_linalg(mod, metadata, opt, *, named_ops=False):
             compile_on_910_95
         )
         if metadata["enable_dynamic_cv_pipeline"]:
-            if metadata["set_workspace_multibuffer"] != None:
-                raise ValueError(
-                    "\"enable_dynamic_cv_pipeline\" cannot be used with \"set_workspace_multibuffer\"."
-                )
+            metadata["set_workspace_multibuffer"] = 0
             metadata["enable_mixed_cv"] = True
             metadata["disable_auto_inject_block_sync"] = True
             ascend.passes.ttir.add_dynamic_cv_pipeline(pm, compile_on_910_95)
@@ -233,7 +232,8 @@ def ttir_to_linalg(mod, metadata, opt, *, named_ops=False):
         pm.run(mod)
         _adjust_metadata_by_module_result(mod, metadata, opt,
                                           enable_mixed_cv=enable_mixed_cv,
-                                          disable_auto_inject_block_sync=disable_auto_inject_block_sync)
+                                          disable_auto_inject_block_sync=disable_auto_inject_block_sync,
+                                          set_workspace_multibuffer=set_workspace_multibuffer)
 
         if opt.debug:
             dump_manager = get_dump_manager(metadata["hash"])
@@ -826,6 +826,7 @@ def linalg_to_bin_enable_npu_compile_A2_A3(linalg: str, metadata, opt):
             ]
 
         if opt.debug:
+            _compile_option_list += ["--mlir-print-ir-after-failure"]
             _compile_option_list += ["--bishengir-print-ir-after=hivm-graph-sync-solver"]
         cmd_list = (
             [npu_compiler_path, ttadapter_path]
@@ -950,7 +951,7 @@ class NPUOptions:
     enable_vf_fusion: bool = None
     # todo: this code will be removed in version 530.
     add_auto_scheduling: bool = False
-    enable_dynamic_cv_pipeline: bool = False
+    enable_dynamic_cv_pipeline: bool = True if is_compile_on_910_95 else False
     hfusion_enable_multiple_consumer_fusion: bool = False
     has_auto_blockify_blacklist_op: Optional[bool] = None
     intra_cache_num: int = None
@@ -1047,6 +1048,12 @@ def ttir_to_npubin(mod, metadata, opt):
                     _compile_option_list += [
                         f"--append-bisheng-options={bisheng_options}"
                     ]
+
+            # Enable SIMT auto-blockify when TRITON_ALL_BLOCKS_PARALLEL is set,
+            # mirroring the SIMD compile paths. driver.py's runtime block-count
+            # cap keys off the same env switch, so the two stay in sync.
+            if _is_auto_map_parallel_blocks_enabled():
+                _compile_option_list += ["--enable-auto-blockify-loop"]
 
         npu_compiler_path, env = _get_npucompiler_path()
         cmd_list = (
