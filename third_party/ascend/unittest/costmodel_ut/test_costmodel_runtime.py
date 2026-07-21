@@ -201,6 +201,63 @@ class CostmodelRuntimeTest(unittest.TestCase):
             self.assertIs(cfg, cfg1)
             self.assertAlmostEqual(t, 1.23)
 
+    def test_normalize_items_infers_feature_params_from_autotune_config(self):
+        class Config:
+            def all_kwargs(self):
+                return {
+                    "set_workspace_multibuffer": 3,
+                    "tile_mix_cube_loop": 2,
+                    "tile_mix_vector_loop": 5,
+                    "BLOCK_M": 128,
+                }
+
+        cfg = Config()
+        pending, latencies = self.cm._normalize_costmodel_items(
+            [{"config": cfg, "ttir": "ttir"}]
+        )
+
+        self.assertEqual(latencies, {})
+        self.assertEqual(
+            pending[0][4],
+            {
+                "set_workspace_multibuffer": 3,
+                "tile_mix_cube_loop": 2,
+                "tile_mix_vector_loop": 5,
+            },
+        )
+
+    def test_compile_param_sources_have_explicit_override_precedence(self):
+        class Config:
+            def all_kwargs(self):
+                return {
+                    "set_workspace_multibuffer": 2,
+                    "tile_mix_cube_loop": 2,
+                    "tile_mix_vector_loop": 2,
+                }
+
+        params = self.cm._extract_compile_params(
+            {
+                "config": Config(),
+                "runtime_compile_params": {
+                    "set_workspace_multibuffer": 3,
+                    "tile_mix_vector_loop": 4,
+                },
+                "compile_params": {
+                    "tile_mix_vector_loop": 5,
+                    "tile_mix_cube_loop": 6,
+                },
+            }
+        )
+
+        self.assertEqual(
+            params,
+            {
+                "set_workspace_multibuffer": 3,
+                "tile_mix_cube_loop": 6,
+                "tile_mix_vector_loop": 5,
+            },
+        )
+
     def test_optional_tilemix_pass_summary_is_flattened(self):
         params = self.cm._extract_compile_params(
             {

@@ -198,8 +198,23 @@ def _resolve_default_hardware_config() -> str:
     return ""
 
 
+def _config_compile_params(config) -> Dict[str, object]:
+    all_kwargs = getattr(config, "all_kwargs", None)
+    if not callable(all_kwargs):
+        return {}
+    try:
+        params = all_kwargs()
+    except Exception:
+        return {}
+    return params if isinstance(params, dict) else {}
+
+
 def _extract_compile_params(item: dict) -> Dict[str, object]:
-    raw_params = item.get("compile_params") or {}
+    raw_params = dict(_config_compile_params(item.get("config")))
+    for source_name in ("runtime_compile_params", "compile_params"):
+        source_params = item.get(source_name)
+        if isinstance(source_params, dict):
+            raw_params.update(source_params)
     params = {
         name: raw_params[name]
         for name in _COSTMODEL_COMPILE_PARAM_KEYS
@@ -301,6 +316,14 @@ def costmodel_bench(config_ttir_items):
             - ``ttir`` (str): TTIR text for costmodel evaluation.
             - ``arg_bindings`` (str, optional): Runtime bindings string passed
               to costmodel (for example ``"arg3=98432,pid_x=0"``).
+            - ``runtime_compile_params`` (dict, optional): Fixed feature
+              parameters supplied by the current kernel invocation.
+            - ``compile_params`` (dict, optional): Explicit per-item feature
+              parameter overrides.
+
+            Supported TileMix and Multibuffer parameters are inferred from
+            ``config.all_kwargs()`` automatically. Runtime parameters override
+            config values, and explicit item parameters have highest priority.
 
     Returns:
         dict: Mapping ``{config: scheduled_cycles}``.
