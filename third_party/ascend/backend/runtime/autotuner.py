@@ -334,6 +334,7 @@ class AutoTilingTuner(Autotuner):
         )
         self._source_module_ast_cache: Optional[ast.Module] = None
         self._source_module_ast_resolved = False
+        self.tile_mix_transform_summaries = {}
 
     @staticmethod
     def _parse_explicit_tunable_params(raw_value) -> List[str]:
@@ -2311,6 +2312,7 @@ class AutoTilingTuner(Autotuner):
         kernels_call = {config: self._make_kernel_call(*args, config=config, **kwargs) for config in configs}
         run_fns = {}
         self._compile_failed_configs = []
+        self.tile_mix_transform_summaries = {}
         exc = None
         exc_stack = ""
 
@@ -2333,6 +2335,12 @@ class AutoTilingTuner(Autotuner):
                                 fut = fut.result()
                             if hasattr(fut, "packed_metadata"):
                                 kernels_call[config].target_kernel_name = fut.packed_metadata.get("kernel_name")
+                                kernels_call[config].tile_mix_transform_summary = fut.packed_metadata.get(
+                                    "tile_mix_transform_summary"
+                                )
+                                self.tile_mix_transform_summaries[config] = (
+                                    kernels_call[config].tile_mix_transform_summary
+                                )
                             run_fns[config] = functools.partial(kernels_call[config], warmup=False)
                         except (CompileTimeAssertionFailure, MLIRCompilationError) as e:
                             import traceback
@@ -2349,6 +2357,10 @@ class AutoTilingTuner(Autotuner):
                     compiled_kernel = fn(warmup=False)
                     if hasattr(compiled_kernel, "packed_metadata"):
                         fn.target_kernel_name = compiled_kernel.packed_metadata.get("kernel_name")
+                        fn.tile_mix_transform_summary = compiled_kernel.packed_metadata.get(
+                            "tile_mix_transform_summary"
+                        )
+                    self.tile_mix_transform_summaries[config] = fn.tile_mix_transform_summary
                     run_fns[config] = functools.partial(fn, warmup=False)
                 except (CompileTimeAssertionFailure, MLIRCompilationError, OutOfResources) as e:
                     import traceback
@@ -2436,6 +2448,9 @@ class AutoTilingTuner(Autotuner):
                 packed_metadata = getattr(res, "packed_metadata", None)
                 if isinstance(packed_metadata, dict):
                     kernel_call.target_kernel_name = packed_metadata.get("kernel_name")
+                    kernel_call.tile_mix_transform_summary = packed_metadata.get(
+                        "tile_mix_transform_summary"
+                    )
             except Exception as e:
                 try:
                     self.post_hook(full_nargs, exception=e)
@@ -2447,6 +2462,7 @@ class AutoTilingTuner(Autotuner):
                 self.post_hook(full_nargs, exception=None)
             return res
         kernel_call.target_kernel_name = None
+        kernel_call.tile_mix_transform_summary = None
         return kernel_call
 
     def warmup(self, *args, **kwargs):

@@ -39,9 +39,11 @@ class CostmodelRuntimeTest(unittest.TestCase):
 
         import sys
 
-        sys.modules.setdefault("triton", triton_mod)
-        sys.modules.setdefault("triton.runtime", runtime_mod)
-        sys.modules.setdefault("triton.runtime.cache", cache_mod)
+        # Other compiler-contract tests install narrower Triton stubs first;
+        # replace them so discovery order does not affect this unit test.
+        sys.modules["triton"] = triton_mod
+        sys.modules["triton.runtime"] = runtime_mod
+        sys.modules["triton.runtime.cache"] = cache_mod
 
         repo_root = Path(__file__).resolve().parents[4]
         module_path = repo_root / "third_party" / "ascend" / "backend" / "runtime" / "costmodel_runtime.py"
@@ -55,7 +57,9 @@ class CostmodelRuntimeTest(unittest.TestCase):
         self.cm._COSTMODEL_MEM_CACHE.clear()
 
     def test_parse_latency_and_jobs(self):
-        self.assertAlmostEqual(self.cm.parse_latency("Estimated Time: 3.25 us"), 3.25)
+        self.assertAlmostEqual(self.cm.parse_total_cycles("Total Cycles: 325"), 325)
+        self.assertAlmostEqual(self.cm.parse_latency("ascend.scheduled_cycles = 64"), 64)
+        self.assertAlmostEqual(self.cm.parse_latency("Roofline model total: 128"), 128)
         self.assertEqual(self.cm.parse_latency("noise"), float("inf"))
 
         with patch.dict("os.environ", {"TRITON_COSTMODEL_WORKER_NUM": "2"}, clear=False):
@@ -96,7 +100,9 @@ class CostmodelRuntimeTest(unittest.TestCase):
             self.assertAlmostEqual(self.cm.load_costmodel_latency(cache_key), 7.5)
 
             payload = mgr.storage[f"{cache_key}.json"]
-            self.assertAlmostEqual(float(json.loads(payload)["latency"]), 7.5)
+            parsed = json.loads(payload)
+            self.assertEqual(parsed["metric"], self.cm._COSTMODEL_CACHE_METRIC_VERSION)
+            self.assertAlmostEqual(float(parsed["cycles"]), 7.5)
 
             mgr.storage[f"{cache_key}.json"] = json.dumps({"latency": "bad-float"})
             self.cm._COSTMODEL_MEM_CACHE.clear()
@@ -110,11 +116,22 @@ class CostmodelRuntimeTest(unittest.TestCase):
         with patch.object(self.cm, "_resolve_default_hardware_config", lambda: "/tmp/ascend_910b.json"):
             self.assertEqual(
                 self.cm._build_costmodel_extra_args("arg1=3", ""),
-                ["-ascend-perf-model", "arg-bindings=arg1=3"],
+                ["-ascend-perf-model=hardware-config=/tmp/ascend_910b.json arg-bindings=arg1=3"],
             )
             self.assertEqual(
                 self.cm._build_costmodel_extra_args("", ""),
-                ["-ascend-perf-model", "hardware-config=/tmp/ascend_910b.json"],
+                ["-ascend-perf-model=hardware-config=/tmp/ascend_910b.json"],
+            )
+            self.assertEqual(
+                self.cm._build_costmodel_extra_args(
+                    "",
+                    "",
+                    {"tile_mix_vector_loop": 4, "tile_mix_cube_loop": 2, "BLOCK_M": 128},
+                ),
+                [
+                    "-ascend-perf-model=hardware-config=/tmp/ascend_910b.json "
+                    "compile-params=tile_mix_vector_loop=4,tile_mix_cube_loop=2"
+                ],
             )
         with patch.object(self.cm, "_resolve_default_hardware_config", lambda: ""):
             self.assertEqual(self.cm._build_costmodel_extra_args("", ""), ["-ascend-perf-model"])
@@ -136,11 +153,11 @@ class CostmodelRuntimeTest(unittest.TestCase):
                 return fake_libtriton
             return real_import(name, globals, locals, fromlist, level)
 
-        with tempfile.NamedTemporaryFile("w", encoding="utf-8") as f:
-            f.write("module-from-file")
-            f.flush()
+        with tempfile.TemporaryDirectory() as tmpdir:
+            ttir_path = Path(tmpdir) / "module.ttir"
+            ttir_path.write_text("module-from-file", encoding="utf-8")
             with patch("builtins.__import__", fake_import):
-                self.assertEqual(self.cm.run_costmodel(f.name, ["-ascend-perf-model"]), "Estimated Time: 1.0 us")
+                self.assertEqual(self.cm.run_costmodel(ttir_path, ["-ascend-perf-model"]), "Estimated Time: 1.0 us")
 
         self.assertEqual(calls[0][0], "module-from-file")
         self.assertIn("-allow-unregistered-dialect", calls[0][1])
@@ -170,24 +187,67 @@ class CostmodelRuntimeTest(unittest.TestCase):
             {"config": cfg1, "ttir": "ttir1", "arg_bindings": "a=1", "hardware_config": "h1"},
             {"config": cfg2, "ttir": ""},
             {"config": None, "ttir": "ignored"},
-            {"config": cfg3, "ttir": "ttir3"},
+            {"config": cfg3, "ttir": "ttir3", "compile_params": {"tile_mix_vector_loop": 4}},
             123,
         ]
 
         pending, lat = self.cm._normalize_costmodel_items(items)
         self.assertEqual(len(pending), 2)
         self.assertEqual(lat[cfg2], float("inf"))
+        self.assertEqual(pending[1][4], {"tile_mix_vector_loop": 4})
 
         with patch.object(self.cm, "load_costmodel_latency", lambda _k: 1.23):
             cfg, t = self.cm._eval_one_costmodel_item(pending[0])
             self.assertIs(cfg, cfg1)
             self.assertAlmostEqual(t, 1.23)
 
+    def test_optional_tilemix_pass_summary_is_flattened(self):
+        params = self.cm._extract_compile_params(
+            {
+                "config": object(),
+                "compile_params": {
+                    "tile_mix_cube_loop": 4,
+                    "tile_mix_vector_loop": 2,
+                },
+                "tile_mix_transform_summary": {
+                    "source": "tile_cube_vector_loop_ir_diff",
+                    "valid": True,
+                    "cube_applied": False,
+                    "vector_applied": True,
+                    "cube_segments": 1,
+                    "vector_segments": 2,
+                    "cube_skip_reason": "pass_rejected_suboptimal",
+                    "vector_skip_reason": "none",
+                    "sync_ops_before": 8,
+                    "sync_ops_after": 6,
+                },
+            }
+        )
+        self.assertEqual(params["tile_mix_summary_valid"], 1)
+        self.assertEqual(params["tile_mix_vector_applied"], 1)
+        self.assertEqual(params["tile_mix_cube_skip_reason"], "pass_rejected_suboptimal")
+        model_arg = self.cm.build_ascend_perf_model_arg(params)
+        self.assertIn("tile_mix_summary_source=tile_cube_vector_loop_ir_diff", model_arg)
+        self.assertIn("tile_mix_sync_ops_after=6", model_arg)
+
+    def test_workspace_multibuffer_is_forwarded_to_ttir_model(self):
+        model_arg = self.cm.build_ascend_perf_model_arg(
+            {
+                "set_workspace_multibuffer": 4,
+                "tile_mix_cube_loop": 2,
+                "tile_mix_vector_loop": 4,
+                "BLOCK_M": 128,
+            }
+        )
+        self.assertIn("set_workspace_multibuffer=4", model_arg)
+        self.assertIn("tile_mix_cube_loop=2", model_arg)
+        self.assertNotIn("BLOCK_M", model_arg)
+
     def test_eval_item_miss_and_pending_eval(self):
         cfg1, cfg2 = object(), object()
         pending = [
-            (cfg1, "ttir1", "arg=1", ""),
-            (cfg2, "ttir2", "", ""),
+            (cfg1, "ttir1", "arg=1", "", {}),
+            (cfg2, "ttir2", "", "", {}),
         ]
         lat = {}
 
@@ -196,7 +256,7 @@ class CostmodelRuntimeTest(unittest.TestCase):
         def fake_run(ttir_or_path, extra_args=None, dump_ir_on_error=False):
             calls.append((ttir_or_path, tuple(extra_args or [])))
             if "ttir1" in ttir_or_path:
-                return "Estimated Time: 9.9 us"
+                return "Total Cycles: 99"
             return None
 
         with patch.object(self.cm, "load_costmodel_latency", lambda _k: None), patch.object(
@@ -206,7 +266,7 @@ class CostmodelRuntimeTest(unittest.TestCase):
         ):
             self.cm._evaluate_pending_items(pending, lat)
 
-        self.assertAlmostEqual(lat[cfg1], 9.9)
+        self.assertAlmostEqual(lat[cfg1], 99)
         self.assertEqual(lat[cfg2], float("inf"))
         self.assertEqual(len(calls), 2)
 
@@ -218,8 +278,8 @@ class CostmodelRuntimeTest(unittest.TestCase):
     def test_evaluate_pending_parallel_exception_tolerated(self):
         cfg1, cfg2 = object(), object()
         pending = [
-            (cfg1, "ttir1", "", ""),
-            (cfg2, "ttir2", "", ""),
+            (cfg1, "ttir1", "", "", {}),
+            (cfg2, "ttir2", "", "", {}),
         ]
         out = {}
 
@@ -248,7 +308,7 @@ class CostmodelRuntimeTest(unittest.TestCase):
         cfg1, cfg2 = object(), object()
         items = [{"config": cfg1, "ttir": "t1"}, {"config": cfg2, "ttir": ""}]
 
-        with patch.object(self.cm, "_normalize_costmodel_items", lambda _x: ([(cfg1, "t1", "", "")], {cfg2: float("inf")})):
+        with patch.object(self.cm, "_normalize_costmodel_items", lambda _x: ([(cfg1, "t1", "", "", {})], {cfg2: float("inf")})):
             def fake_eval(_pending, out):
                 out[cfg1] = 0.88
 

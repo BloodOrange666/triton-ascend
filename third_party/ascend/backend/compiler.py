@@ -68,6 +68,12 @@ from triton.runtime.cache import get_dump_manager
 from triton.tools.get_ascend_devices import is_compile_on_910_95
 
 
+# Side channel used by the compile-only costmodel path.  The release branch
+# keeps the optimized TTIR in memory so each autotune candidate can be modeled
+# without lowering to a device binary first.
+_costmodel_ttir: Optional[str] = None
+
+
 # TODO: materialize the concrete min shape
 def min_dot_size(target: GPUTarget):
     return lambda lhsType, rhsType: (1, 1, 1)
@@ -118,6 +124,8 @@ def _adjust_metadata_by_module_result(mod, metadata, opt, **kwargs):
 
 
 def make_ttir(mod, metadata, opt):
+    global _costmodel_ttir
+
     if "hash" not in metadata:
         metadata["hash"] = hashlib.sha256(f"{mod}-{metadata}".encode()).hexdigest()
     # the same optimize pass for triton-ir as all other backends
@@ -132,7 +140,12 @@ def make_ttir(mod, metadata, opt):
     passes.common.add_symbol_dce(pm)
     passes.ttir.add_loop_unroll(pm)
     pm.run(mod)
-    if opt.debug:
+    if getattr(opt, "enable_costmodel_backend", False):
+        _costmodel_ttir = str(mod)
+        output_path = os.getenv("TRITON_COSTMODEL_TTIR_FILE")
+        if output_path:
+            Path(output_path).write_text(_costmodel_ttir, encoding="utf-8")
+    elif opt.debug:
         dump_manager = get_dump_manager(metadata["hash"])
         print(f"Dumping intermediate results to {dump_manager.cache_dir}")
         dump_manager.put(str(mod), "kernel.ttir.mlir", binary=False)
@@ -817,6 +830,23 @@ def linalg_to_bin_enable_npu_compile_A2_A3(linalg: str, metadata, opt):
             _compile_option_list += \
                 [f"--tile-mix-cube-loop={tile_mix_cube_loop}"]
 
+        capture_tilemix_summary = False
+        parse_tilemix_pass_summary = None
+        try:
+            from triton.backends.ascend.runtime.tilemix_pass_summary import (
+                add_tilemix_pass_dump_options,
+                parse_tilemix_pass_summary,
+            )
+
+            capture_tilemix_summary = add_tilemix_pass_dump_options(
+                _compile_option_list,
+                tile_mix_cube_loop,
+                tile_mix_vector_loop,
+            )
+        except ImportError:
+            # Optional second-stage validation must not block normal compile.
+            pass
+
         auto_multi_buffer = metadata["limit_auto_multi_buffer_of_local_buffer"]
         if auto_multi_buffer is not None:
             _compile_option_list += \
@@ -878,6 +908,16 @@ def linalg_to_bin_enable_npu_compile_A2_A3(linalg: str, metadata, opt):
 
         if opt.debug:
             _save_npuir_debug_output(ret.stdout, ret.stderr, tmpdir, metadata["hash"])
+
+        if capture_tilemix_summary and parse_tilemix_pass_summary is not None:
+            compiler_output = b"\n".join((ret.stdout or b"", ret.stderr or b"")).decode(
+                "utf-8", errors="replace"
+            )
+            metadata["tile_mix_transform_summary"] = parse_tilemix_pass_summary(
+                compiler_output,
+                cube_loop=tile_mix_cube_loop,
+                vector_loop=tile_mix_vector_loop,
+            )
 
         stdout_str = ret.stdout.decode('utf-8') if ret.stdout else ''
         match = re.search(r'UB\s+size\s*=\s*(\d+)\s*bits', stdout_str)
@@ -1152,6 +1192,9 @@ class AscendBackend(BaseBackend):
             "hash": metadata.hash,
             "debug": metadata.debug,
             "tensor_kinds": metadata.tensor_kinds,
+            "tile_mix_transform_summary": getattr(
+                metadata, "tile_mix_transform_summary", None
+            ),
         }
 
     def get_codegen_implementation(self):
