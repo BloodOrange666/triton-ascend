@@ -28,6 +28,39 @@ def _costmodel_cache_namespace() -> str:
 
 
 _COSTMODEL_MEM_CACHE: Dict[str, float] = {}
+_COSTMODEL_COMPILE_PARAM_KEYS = (
+    "set_workspace_multibuffer",
+    "tile_mix_vector_loop",
+    "tile_mix_cube_loop",
+    "tile_mix_summary_source",
+    "tile_mix_summary_valid",
+    "tile_mix_cube_applied",
+    "tile_mix_vector_applied",
+    "tile_mix_cube_segments",
+    "tile_mix_vector_segments",
+    "tile_mix_cube_skip_reason",
+    "tile_mix_vector_skip_reason",
+    "tile_mix_sync_ops_before",
+    "tile_mix_sync_ops_after",
+)
+_COSTMODEL_CACHE_METRIC_VERSION = "scheduled_cycles_v15_ttir_finite_multibuffer_tail"
+
+
+def _flatten_tilemix_transform_summary(summary) -> Dict[str, object]:
+    if not isinstance(summary, dict):
+        return {}
+    return {
+        "tile_mix_summary_source": summary.get("source", "unknown"),
+        "tile_mix_summary_valid": int(bool(summary.get("valid", False))),
+        "tile_mix_cube_applied": int(bool(summary.get("cube_applied", False))),
+        "tile_mix_vector_applied": int(bool(summary.get("vector_applied", False))),
+        "tile_mix_cube_segments": summary.get("cube_segments", 1),
+        "tile_mix_vector_segments": summary.get("vector_segments", 1),
+        "tile_mix_cube_skip_reason": summary.get("cube_skip_reason", "unknown"),
+        "tile_mix_vector_skip_reason": summary.get("vector_skip_reason", "unknown"),
+        "tile_mix_sync_ops_before": summary.get("sync_ops_before", 0),
+        "tile_mix_sync_ops_after": summary.get("sync_ops_after", 0),
+    }
 
 
 def run_costmodel(ttir_or_path, extra_args=None, dump_ir_on_error=False):
@@ -69,6 +102,8 @@ def get_costmodel_jobs(num_tasks: int) -> int:
 
 def make_costmodel_cache_key(ttir: str, extra_args: Optional[List[str]]) -> str:
     h = hashlib.sha256()
+    h.update(_COSTMODEL_CACHE_METRIC_VERSION.encode("utf-8"))
+    h.update(b"|")
     h.update(ttir.encode("utf-8"))
     h.update(b"|")
     if extra_args:
@@ -91,25 +126,59 @@ def load_costmodel_latency(cache_key: str) -> Optional[float]:
 
     try:
         parsed = json.loads(payload)
-        latency = float(parsed["latency"])
-        _COSTMODEL_MEM_CACHE[cache_key] = latency
-        return latency
+        score = float(parsed["cycles"] if "cycles" in parsed else parsed["latency"])
+        _COSTMODEL_MEM_CACHE[cache_key] = score
+        return score
     except Exception:
         return None
 
 
-def store_costmodel_latency(cache_key: str, latency: float) -> None:
-    _COSTMODEL_MEM_CACHE[cache_key] = latency
+def store_costmodel_latency(cache_key: str, cycles: float) -> None:
+    _COSTMODEL_MEM_CACHE[cache_key] = cycles
     cache_manager = get_cache_manager(_costmodel_cache_namespace())
     file_name = f"{cache_key}.json"
-    cache_manager.put(json.dumps({"latency": latency}), file_name, binary=False)
+    cache_manager.put(
+        json.dumps({"metric": _COSTMODEL_CACHE_METRIC_VERSION, "cycles": cycles}),
+        file_name,
+        binary=False,
+    )
+
+
+def parse_total_cycles(stdout: str) -> float:
+    import re
+
+    patterns = (
+        r"Total Cycles:\s+([0-9]+)",
+        r"ascend\.scheduled_cycles\s*=\s*([0-9]+)",
+        r"Roofline model .*?:\s+([0-9]+)",
+    )
+    for pattern in patterns:
+        match = re.search(pattern, stdout)
+        if match:
+            return float(match.group(1))
+    return float("inf")
 
 
 def parse_latency(stdout: str) -> float:
-    import re
+    """Backward-compatible API name; the ranking metric is scheduled cycles."""
+    return parse_total_cycles(stdout)
 
-    match = re.search(r"Estimated Time:\s+([0-9.]+)\s*us", stdout)
-    return float(match.group(1)) if match else float("inf")
+
+def _format_compile_params(config_kwargs: Optional[Dict[str, object]]) -> str:
+    if not config_kwargs:
+        return ""
+    return ",".join(
+        f"{name}={config_kwargs[name]}"
+        for name in _COSTMODEL_COMPILE_PARAM_KEYS
+        if config_kwargs.get(name) is not None
+    )
+
+
+def build_ascend_perf_model_arg(config_kwargs: Optional[Dict[str, object]] = None) -> str:
+    compile_params = _format_compile_params(config_kwargs)
+    if not compile_params:
+        return "-ascend-perf-model"
+    return f"-ascend-perf-model=compile-params={compile_params}"
 
 
 def _warn_costmodel(msg: str) -> None:
@@ -129,16 +198,51 @@ def _resolve_default_hardware_config() -> str:
     return ""
 
 
-def _build_costmodel_extra_args(arg_bindings: str, hardware_config: str = ""):
-    base = "-ascend-perf-model"
+def _config_compile_params(config) -> Dict[str, object]:
+    all_kwargs = getattr(config, "all_kwargs", None)
+    if not callable(all_kwargs):
+        return {}
+    try:
+        params = all_kwargs()
+    except Exception:
+        return {}
+    return params if isinstance(params, dict) else {}
+
+
+def _extract_compile_params(item: dict) -> Dict[str, object]:
+    raw_params = dict(_config_compile_params(item.get("config")))
+    for source_name in ("runtime_compile_params", "compile_params"):
+        source_params = item.get(source_name)
+        if isinstance(source_params, dict):
+            raw_params.update(source_params)
+    params = {
+        name: raw_params[name]
+        for name in _COSTMODEL_COMPILE_PARAM_KEYS
+        if raw_params.get(name) is not None
+    }
+    params.update(
+        _flatten_tilemix_transform_summary(item.get("tile_mix_transform_summary"))
+    )
+    return params
+
+
+def _build_costmodel_extra_args(
+    arg_bindings: str,
+    hardware_config: str = "",
+    config_kwargs: Optional[Dict[str, object]] = None,
+):
     resolved_hardware_config = hardware_config or _resolve_default_hardware_config()
-    # NOTE: Current inproc parser in installed runtime consumes only one payload
-    # token after `-ascend-perf-model`. Frontend only forwards arg-bindings now.
-    if arg_bindings:
-        return [base, f"arg-bindings={arg_bindings}"]
+    payload = []
     if resolved_hardware_config:
-        return [base, f"hardware-config={resolved_hardware_config}"]
-    return [base]
+        payload.append(f"hardware-config={resolved_hardware_config}")
+    if arg_bindings:
+        payload.append(f"arg-bindings={arg_bindings}")
+    compile_params = _format_compile_params(config_kwargs)
+    if compile_params:
+        payload.append(f"compile-params={compile_params}")
+    if not payload:
+        return ["-ascend-perf-model"]
+    return [f"-ascend-perf-model={' '.join(payload)}"]
 
 
 def _normalize_costmodel_items(config_ttir_items):
@@ -152,28 +256,33 @@ def _normalize_costmodel_items(config_ttir_items):
         ttir = item.get("ttir")
         arg_bindings = item.get("arg_bindings", "")
         hardware_config = item.get("hardware_config", "")
+        compile_params = _extract_compile_params(item)
         if config is None:
             continue
         if not ttir:
             costmodel_latencies[config] = float("inf")
             continue
-        pending_items.append((config, ttir, arg_bindings, hardware_config))
+        pending_items.append(
+            (config, ttir, arg_bindings, hardware_config, compile_params)
+        )
 
     return pending_items, costmodel_latencies
 
 
 def _eval_one_costmodel_item(item):
-    config, ttir, arg_bindings, hardware_config = item
-    extra_args = _build_costmodel_extra_args(arg_bindings, hardware_config)
+    config, ttir, arg_bindings, hardware_config, compile_params = item
+    extra_args = _build_costmodel_extra_args(
+        arg_bindings, hardware_config, compile_params
+    )
     cache_key = make_costmodel_cache_key(ttir, extra_args)
     cached = load_costmodel_latency(cache_key)
     if cached is not None:
         return config, cached
 
     output = run_costmodel(ttir_or_path=ttir, extra_args=extra_args)
-    latency = float("inf") if output is None else parse_latency(output)
-    store_costmodel_latency(cache_key, latency)
-    return config, latency
+    cycles = float("inf") if output is None else parse_total_cycles(output)
+    store_costmodel_latency(cache_key, cycles)
+    return config, cycles
 
 
 def _evaluate_pending_items(pending_items, costmodel_latencies):
@@ -207,9 +316,17 @@ def costmodel_bench(config_ttir_items):
             - ``ttir`` (str): TTIR text for costmodel evaluation.
             - ``arg_bindings`` (str, optional): Runtime bindings string passed
               to costmodel (for example ``"arg3=98432,pid_x=0"``).
+            - ``runtime_compile_params`` (dict, optional): Fixed feature
+              parameters supplied by the current kernel invocation.
+            - ``compile_params`` (dict, optional): Explicit per-item feature
+              parameter overrides.
+
+            Supported TileMix and Multibuffer parameters are inferred from
+            ``config.all_kwargs()`` automatically. Runtime parameters override
+            config values, and explicit item parameters have highest priority.
 
     Returns:
-        dict: Mapping ``{config: latency_us}``.
+        dict: Mapping ``{config: scheduled_cycles}``.
             Returns ``float("inf")`` for configs with missing/invalid TTIR or
             evaluation failures. Returns an empty dict for invalid/empty input.
     """
