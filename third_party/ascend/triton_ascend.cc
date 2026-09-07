@@ -35,7 +35,6 @@
 #include <pybind11/stl.h>
 
 #if TRITON_ASCEND_HAS_INPROC_COSTMODEL
-#include "AscendModel/Analysis/HIVMAnalysis.h"
 #include "AscendModel/Analysis/HardwareConfig.h"
 #include "AscendModel/IR/AscendModelDialect.h"
 #include "AscendModel/Transforms/Passes.h"
@@ -52,9 +51,6 @@
 #include <stdexcept>
 #include <vector>
 
-#include "llvm/ADT/SmallString.h"
-#include "llvm/Support/FileSystem.h"
-#include "llvm/Support/raw_ostream.h"
 #endif
 
 namespace py = pybind11;
@@ -463,40 +459,6 @@ runAscendCostModelInProcess(const std::string &mlirText,
   return os.str();
 }
 
-static std::string
-runHIVMCostModelInProcess(const std::string &mlirText,
-                          const std::string &hardwareConfigPath,
-                          const std::string &argBindings = "") {
-  std::string loadError;
-  auto config = mlir::ascend::loadHardwareConfigForAnalysis(hardwareConfigPath,
-                                                            loadError);
-  if (!config)
-    throw std::runtime_error("failed to load HIVM hardware config: " +
-                             loadError);
-
-  int fd = -1;
-  llvm::SmallString<128> path;
-  if (auto ec = llvm::sys::fs::createTemporaryFile("triton-hivm-costmodel",
-                                                   "mlir", fd, path))
-    throw std::runtime_error("failed to create temporary HIVM IR file: " +
-                             ec.message());
-  {
-    llvm::raw_fd_ostream os(fd, true);
-    os << mlirText;
-  }
-
-  mlir::ascend::HIVMAnalyzer analyzer(*config, argBindings);
-  mlir::ascend::HIVMAnalysisReport report;
-  std::string error;
-  bool ok = analyzer.analyzeFile(path, report, error);
-  llvm::sys::fs::remove(path);
-  if (!ok)
-    throw std::runtime_error("in-process HIVM analysis failed: " + error);
-  std::string result;
-  llvm::raw_string_ostream os(result);
-  report.print(os, *config);
-  return os.str();
-}
 #endif
 
 // Forward declaration for ascend_ir bindings (defined in ascend_ir.cc)
@@ -527,16 +489,6 @@ void init_triton_ascend(py::module &&m) {
         return runAscendCostModelInProcess(mlirText, extraArgs);
       },
       py::arg("mlir_text"), py::arg("extra_args") = std::vector<std::string>{});
-  m.def(
-      "run_hivm_costmodel_inproc",
-      [](const std::string &mlirText, const std::string &hardwareConfigPath,
-         const std::string &argBindings) {
-        py::gil_scoped_release release;
-        return runHIVMCostModelInProcess(mlirText, hardwareConfigPath,
-                                         argBindings);
-      },
-      py::arg("mlir_text"), py::arg("hardware_config"),
-      py::arg("arg_bindings") = "");
 #else
   m.def(
       "run_costmodel_inproc",
@@ -546,15 +498,6 @@ void init_triton_ascend(py::module &&m) {
         return std::string();
       },
       py::arg("mlir_text"), py::arg("extra_args") = std::vector<std::string>{});
-  m.def(
-      "run_hivm_costmodel_inproc",
-      [](const std::string &, const std::string &, const std::string &) {
-        throw std::runtime_error(
-            "in-process costmodel bridge is not enabled in this build");
-        return std::string();
-      },
-      py::arg("mlir_text"), py::arg("hardware_config"),
-      py::arg("arg_bindings") = "");
 #endif
 
   // Initialize ascend IR bindings (ascendnpu_ir_builder, scope/hivm dialects)
